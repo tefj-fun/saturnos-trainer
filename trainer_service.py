@@ -166,7 +166,41 @@ def run_training_job(supabase, run):
     optimizer = config.get("optimizer", "Adam")
     device = config.get("device", 0)
 
+    start_time = time.time()
+    last_progress_update = 0.0
+
+    def on_epoch_end(trainer):
+        nonlocal last_progress_update
+        now = time.time()
+        epoch = int(getattr(trainer, "epoch", 0))
+        epochs = int(getattr(trainer, "epochs", 0) or 0)
+        if epochs <= 0:
+            return
+        if (epoch + 1) % 5 != 0 and now - last_progress_update < 60:
+            return
+        progress = (epoch + 1) / epochs
+        elapsed = now - start_time
+        eta = max((elapsed / progress) - elapsed, 0.0) if progress > 0 else None
+        update_run(
+            supabase,
+            run_id,
+            {
+                "status": "running",
+                "results": {
+                    "progress": {
+                        "epoch": epoch + 1,
+                        "epochs": epochs,
+                        "percent": round(progress * 100, 2),
+                        "eta_seconds": int(eta) if eta is not None else None,
+                        "updated_at": utc_now(),
+                    }
+                },
+            },
+        )
+        last_progress_update = now
+
     model = YOLO(model_path)
+    model.add_callback("on_fit_epoch_end", on_epoch_end)
     results = model.train(
         data=data_yaml,
         epochs=epochs,
