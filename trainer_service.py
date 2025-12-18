@@ -3,6 +3,8 @@ import json
 import os
 import socket
 import time
+import urllib.request
+from urllib.parse import urlparse, unquote
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -33,11 +35,52 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def resolve_data_yaml(value):
+def extract_storage_path(value):
+    if not value:
+        return None
+    if value.startswith("storage:"):
+        return value.split("storage:", 1)[1].lstrip("/")
+    if value.startswith("http"):
+        parsed = urlparse(value)
+        public_prefix = f"/storage/v1/object/public/{SUPABASE_STORAGE_BUCKET}/"
+        signed_prefix = f"/storage/v1/object/sign/{SUPABASE_STORAGE_BUCKET}/"
+        object_prefix = f"/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/"
+        for prefix in (public_prefix, signed_prefix, object_prefix):
+            if prefix in parsed.path:
+                return unquote(parsed.path.split(prefix)[1])
+    return None
+
+
+def download_storage_file(supabase, remote_path, local_path):
+    result = supabase.storage.from_(SUPABASE_STORAGE_BUCKET).download(remote_path)
+    content = getattr(result, "data", result)
+    if isinstance(content, dict) and "data" in content:
+        content = content["data"]
+    if not isinstance(content, (bytes, bytearray)):
+        raise RuntimeError("Unexpected storage download response type.")
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    with open(local_path, "wb") as handle:
+        handle.write(content)
+    return local_path
+
+
+def resolve_data_yaml(value, run_id, supabase):
     if not value:
         return None
     if os.path.isabs(value):
         return value
+    storage_path = extract_storage_path(value)
+    if storage_path:
+        local_dir = os.path.join(DATASET_ROOT, "datasets", f"run_{run_id}")
+        filename = os.path.basename(storage_path) or "data.yaml"
+        local_path = os.path.join(local_dir, filename)
+        return download_storage_file(supabase, storage_path, local_path)
+    if value.startswith("http"):
+        local_dir = os.path.join(DATASET_ROOT, "datasets", f"run_{run_id}")
+        os.makedirs(local_dir, exist_ok=True)
+        local_path = os.path.join(local_dir, "data.yaml")
+        urllib.request.urlretrieve(value, local_path)
+        return local_path
     return os.path.join(DATASET_ROOT, value)
 
 
@@ -145,7 +188,7 @@ def update_run(supabase, run_id, updates):
 def run_training_job(supabase, run):
     run_id = run["id"]
     config = parse_config(run.get("configuration"))
-    data_yaml = resolve_data_yaml(run.get("data_yaml") or config.get("dataYaml"))
+    data_yaml = resolve_data_yaml(run.get("data_yaml") or config.get("dataYaml"), run_id, supabase)
     if not data_yaml or not os.path.exists(data_yaml):
         update_run(
             supabase,
@@ -166,41 +209,7 @@ def run_training_job(supabase, run):
     optimizer = config.get("optimizer", "Adam")
     device = config.get("device", 0)
 
-    start_time = time.time()
-    last_progress_update = 0.0
-
-    def on_epoch_end(trainer):
-        nonlocal last_progress_update
-        now = time.time()
-        epoch = int(getattr(trainer, "epoch", 0))
-        epochs = int(getattr(trainer, "epochs", 0) or 0)
-        if epochs <= 0:
-            return
-        if (epoch + 1) % 5 != 0 and now - last_progress_update < 60:
-            return
-        progress = (epoch + 1) / epochs
-        elapsed = now - start_time
-        eta = max((elapsed / progress) - elapsed, 0.0) if progress > 0 else None
-        update_run(
-            supabase,
-            run_id,
-            {
-                "status": "running",
-                "results": {
-                    "progress": {
-                        "epoch": epoch + 1,
-                        "epochs": epochs,
-                        "percent": round(progress * 100, 2),
-                        "eta_seconds": int(eta) if eta is not None else None,
-                        "updated_at": utc_now(),
-                    }
-                },
-            },
-        )
-        last_progress_update = now
-
     model = YOLO(model_path)
-    model.add_callback("on_fit_epoch_end", on_epoch_end)
     results = model.train(
         data=data_yaml,
         epochs=epochs,
