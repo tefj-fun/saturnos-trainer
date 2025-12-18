@@ -5,10 +5,13 @@ import socket
 import time
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
 from supabase import create_client
 from ultralytics import YOLO
 
 RUNS_TABLE = "training_runs"
+
+load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -213,10 +216,13 @@ def main():
 
     supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     os.makedirs(RUNS_DIR, exist_ok=True)
+    print(f"[{utc_now()}] Trainer service started (worker_id={WORKER_ID})")
+    print(f"[{utc_now()}] Polling {RUNS_TABLE} every {POLL_INTERVAL}s")
 
     while True:
         run = get_next_run(supabase)
         if not run:
+            print(f"[{utc_now()}] No queued runs. Sleeping {POLL_INTERVAL}s.")
             time.sleep(POLL_INTERVAL)
             continue
 
@@ -232,8 +238,11 @@ def main():
         )
 
         try:
+            print(f"[{utc_now()}] Starting run {run['id']}")
             run_training_job(supabase, run)
+            print(f"[{utc_now()}] Completed run {run['id']}")
         except Exception as exc:
+            print(f"[{utc_now()}] Run {run['id']} failed: {exc}")
             update_run(
                 supabase,
                 run["id"],
