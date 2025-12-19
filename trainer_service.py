@@ -39,7 +39,13 @@ PROGRESS_INTERVAL = int(os.getenv("PROGRESS_INTERVAL", "10"))
 CANCEL_CHECK_INTERVAL = int(os.getenv("CANCEL_CHECK_INTERVAL", "5"))
 WORKER_ID = os.getenv("WORKER_ID", socket.gethostname())
 
-MODEL_MAP = {
+MODEL_MAP_DETECT = {
+    "YOLOv8n": "yolov8n.pt",
+    "YOLOv8s": "yolov8s.pt",
+    "YOLOv8m": "yolov8m.pt",
+}
+
+MODEL_MAP_SEGMENT = {
     "YOLOv8n": "yolov8n-seg.pt",
     "YOLOv8s": "yolov8s-seg.pt",
     "YOLOv8m": "yolov8m-seg.pt",
@@ -182,12 +188,69 @@ def normalize_data_yaml(yaml_path, local_dir):
     return yaml_path
 
 
-def map_base_model(value):
+def normalize_task(raw_task):
+    if not raw_task:
+        return None
+    task = str(raw_task).strip().lower()
+    if task.startswith("seg"):
+        return "segment"
+    if task.startswith("det"):
+        return "detect"
+    return None
+
+
+def infer_task_from_labels(dataset_root):
+    if not dataset_root or not os.path.isdir(dataset_root):
+        return "detect"
+    label_roots = [
+        os.path.join(dataset_root, "labels", "train"),
+        os.path.join(dataset_root, "labels", "val"),
+        os.path.join(dataset_root, "labels", "test"),
+    ]
+    for label_root in label_roots:
+        if not os.path.isdir(label_root):
+            continue
+        for name in os.listdir(label_root):
+            if not name.endswith(".txt"):
+                continue
+            label_path = os.path.join(label_root, name)
+            try:
+                with open(label_path, "r", encoding="utf-8") as handle:
+                    for raw_line in handle:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        parts = line.split()
+                        if len(parts) > 5:
+                            return "segment"
+                        if len(parts) == 5:
+                            continue
+            except Exception:
+                continue
+    return "detect"
+
+
+def resolve_task(config, data_yaml):
+    task = normalize_task(config.get("task"))
+    if task:
+        return task
+    task = normalize_task(config.get("modelTask"))
+    if task:
+        return task
+    task = normalize_task(config.get("trainingTask"))
+    if task:
+        return task
+    dataset_root = os.path.dirname(data_yaml) if data_yaml else None
+    return infer_task_from_labels(dataset_root)
+
+
+def map_base_model(value, task):
     if not value:
-        return MODEL_MAP["YOLOv8s"]
+        return MODEL_MAP_DETECT["YOLOv8s"] if task == "detect" else MODEL_MAP_SEGMENT["YOLOv8s"]
     if value.endswith(".pt"):
         return value
-    return MODEL_MAP.get(value, value)
+    model_map = MODEL_MAP_SEGMENT if task == "segment" else MODEL_MAP_DETECT
+    return model_map.get(value, value)
 
 
 def parse_config(raw_config):
@@ -513,7 +576,8 @@ def run_training_job(supabase, run):
         )
         return
 
-    model_path = map_base_model(run.get("base_model"))
+    task = resolve_task(config, data_yaml)
+    model_path = map_base_model(run.get("base_model"), task)
     epochs = int(config.get("epochs", 100))
     batch = int(config.get("batchSize", 16))
     imgsz = int(config.get("imgSize", 640))
