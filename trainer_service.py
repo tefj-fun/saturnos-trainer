@@ -2,6 +2,8 @@ import csv
 import json
 import os
 import socket
+import mimetypes
+import threading
 import time
 import urllib.request
 from urllib.parse import urlparse, unquote
@@ -9,20 +11,32 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from supabase import create_client
+
+try:
+    from supabase import ClientOptions
+except Exception:
+    ClientOptions = None
 from ultralytics import YOLO
 
 RUNS_TABLE = "training_runs"
+WORKERS_TABLE = "trainer_workers"
 
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
+if SUPABASE_URL and not SUPABASE_URL.endswith("/"):
+    SUPABASE_URL = f"{SUPABASE_URL}/"
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "sops")
 SUPABASE_DATASETS_BUCKET = os.getenv("SUPABASE_DATASETS_BUCKET", "datasets")
+SUPABASE_ARTIFACTS_BUCKET = os.getenv("SUPABASE_ARTIFACTS_BUCKET", "training-artifacts")
 
 DATASET_ROOT = os.getenv("DATASET_ROOT", "/mnt/d/datasets")
 RUNS_DIR = os.getenv("RUNS_DIR", "/mnt/d/datasets/runs")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "10"))
+PROGRESS_INTERVAL = int(os.getenv("PROGRESS_INTERVAL", "10"))
+CANCEL_CHECK_INTERVAL = int(os.getenv("CANCEL_CHECK_INTERVAL", "5"))
 WORKER_ID = os.getenv("WORKER_ID", socket.gethostname())
 
 MODEL_MAP = {
@@ -175,14 +189,101 @@ def parse_results_csv(path):
     return metrics
 
 
+def guess_content_type(filename):
+    if not filename:
+        return "application/octet-stream"
+    extension = os.path.splitext(filename.lower())[1]
+    if extension in (".pt", ".pth", ".bin"):
+        return "application/octet-stream"
+    if extension == ".csv":
+        return "text/csv"
+    if extension == ".jpg" or extension == ".jpeg":
+        return "image/jpeg"
+    if extension == ".png":
+        return "image/png"
+    if extension == ".webp":
+        return "image/webp"
+    if extension == ".json":
+        return "application/json"
+    if extension in (".txt", ".log"):
+        return "text/plain"
+    guessed, _ = mimetypes.guess_type(filename)
+    return guessed or "application/octet-stream"
+
+
+def format_eta(seconds):
+    if seconds is None:
+        return None
+    seconds = max(0, int(seconds))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    remaining = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{remaining:02d}"
+
+
+def read_latest_metrics(path):
+    if not os.path.exists(path):
+        return None, None
+    with open(path, "r", newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+    if not rows:
+        return None, None
+    row = rows[-1]
+    epoch_value = None
+    for key in ("epoch", "Epoch"):
+        raw = row.get(key)
+        if raw not in (None, ""):
+            try:
+                epoch_value = int(float(raw))
+            except ValueError:
+                epoch_value = None
+            break
+    if epoch_value is None:
+        epoch = len(rows)
+    else:
+        epoch = epoch_value + 1
+    row["epoch"] = epoch
+    return row, epoch
+
+
+def update_training_progress(supabase, run_id, total_epochs, results_csv_path, started_at, last_epoch):
+    row, epoch = read_latest_metrics(results_csv_path)
+    if epoch is None or epoch == last_epoch:
+        return last_epoch
+    percent = None
+    if total_epochs:
+        percent = min(100.0, (epoch / total_epochs) * 100.0)
+    elapsed = time.time() - started_at
+    eta_seconds = None
+    if total_epochs and epoch > 0:
+        seconds_per_epoch = elapsed / epoch
+        eta_seconds = int(seconds_per_epoch * max(0, total_epochs - epoch))
+    updates = {
+        "results": {
+            "metrics": row,
+            "progress": {
+                "epoch": epoch,
+                "total_epochs": total_epochs,
+                "percent": percent,
+                "eta_seconds": eta_seconds,
+                "eta": format_eta(eta_seconds),
+            },
+        }
+    }
+    update_run(supabase, run_id, updates)
+    return epoch
+
+
 def upload_file(supabase, local_path, remote_path):
+    content_type = guess_content_type(local_path)
     with open(local_path, "rb") as handle:
-        supabase.storage.from_(SUPABASE_STORAGE_BUCKET).upload(
+        supabase.storage.from_(SUPABASE_ARTIFACTS_BUCKET).upload(
             remote_path,
             handle,
-            {"content-type": "application/octet-stream", "x-upsert": "true"},
+            {"content-type": content_type, "x-upsert": "true"},
         )
-    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_STORAGE_BUCKET}/{remote_path}"
+    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_ARTIFACTS_BUCKET}/{remote_path}"
 
 
 def upload_artifacts(supabase, run_id, save_dir):
@@ -210,11 +311,23 @@ def get_next_run(supabase):
         supabase.table(RUNS_TABLE)
         .select("*")
         .in_("status", ["queued", "running"])
+        .eq("cancel_requested", False)
         .is_("started_at", "null")
         .order("created_at", desc=False)
         .limit(1)
         .execute()
     )
+    error = getattr(response, "error", None)
+    if error and "cancel_requested" in str(error):
+        response = (
+            supabase.table(RUNS_TABLE)
+            .select("*")
+            .in_("status", ["queued", "running"])
+            .is_("started_at", "null")
+            .order("created_at", desc=False)
+            .limit(1)
+            .execute()
+        )
     data = response.data or []
     return data[0] if data else None
 
@@ -226,6 +339,109 @@ def update_run(supabase, run_id, updates):
         .eq("id", run_id)
         .execute()
     )
+
+
+def is_cancel_requested(supabase, run_id):
+    try:
+        response = (
+            supabase.table(RUNS_TABLE)
+            .select("cancel_requested")
+            .eq("id", run_id)
+            .single()
+            .execute()
+        )
+    except Exception:
+        return False
+    error = getattr(response, "error", None)
+    if error and "cancel_requested" in str(error):
+        return False
+    data = response.data or {}
+    return bool(data.get("cancel_requested"))
+
+
+def upsert_worker_heartbeat(supabase, status="online"):
+    payload = {
+        "worker_id": WORKER_ID,
+        "status": status,
+        "last_seen": utc_now(),
+    }
+    try:
+        supabase.table(WORKERS_TABLE).upsert(payload, on_conflict="worker_id").execute()
+    except Exception as exc:
+        print(f"[{utc_now()}] Failed to update worker heartbeat: {exc}")
+
+
+def start_heartbeat_thread(supabase, status):
+    stop_event = threading.Event()
+
+    def loop():
+        while not stop_event.is_set():
+            upsert_worker_heartbeat(supabase, status=status)
+            stop_event.wait(HEARTBEAT_INTERVAL)
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    return stop_event, thread
+
+
+def start_progress_thread(supabase, run_id, total_epochs, results_csv_path, cancel_event):
+    stop_event = threading.Event()
+    started_at = time.time()
+    last_epoch_holder = {"value": 0}
+
+    def loop():
+        while not stop_event.is_set() and not cancel_event.is_set():
+            last_epoch_holder["value"] = update_training_progress(
+                supabase,
+                run_id,
+                total_epochs,
+                results_csv_path,
+                started_at,
+                last_epoch_holder["value"],
+            )
+            stop_event.wait(PROGRESS_INTERVAL)
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    return stop_event, thread
+
+
+def start_cancel_poll_thread(supabase, run_id, cancel_event):
+    stop_event = threading.Event()
+
+    def loop():
+        while not stop_event.is_set() and not cancel_event.is_set():
+            if is_cancel_requested(supabase, run_id):
+                cancel_event.set()
+                update_run(supabase, run_id, {"status": "canceling"})
+                break
+            stop_event.wait(CANCEL_CHECK_INTERVAL)
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    return stop_event, thread
+
+
+def build_cancel_callbacks(model, cancel_event):
+    def check_cancel(trainer):
+        if cancel_event.is_set():
+            trainer.stop = True
+
+    if hasattr(model, "add_callback"):
+        added = 0
+        for name in ("on_fit_epoch_end", "on_train_epoch_end", "on_train_batch_end"):
+            try:
+                model.add_callback(name, check_cancel)
+                added += 1
+            except Exception:
+                continue
+        if added:
+            return None
+
+    return {
+        "on_fit_epoch_end": check_cancel,
+        "on_train_epoch_end": check_cancel,
+    }
 
 
 def run_training_job(supabase, run):
@@ -243,6 +459,18 @@ def run_training_job(supabase, run):
             },
         )
         return
+    if is_cancel_requested(supabase, run_id):
+        update_run(
+            supabase,
+            run_id,
+            {
+                "status": "canceled",
+                "canceled_at": utc_now(),
+                "completed_at": utc_now(),
+                "error_message": "Canceled by user.",
+            },
+        )
+        return
 
     model_path = map_base_model(run.get("base_model"))
     epochs = int(config.get("epochs", 100))
@@ -252,19 +480,75 @@ def run_training_job(supabase, run):
     optimizer = config.get("optimizer", "Adam")
     device = config.get("device", 0)
 
-    model = YOLO(model_path)
-    results = model.train(
-        data=data_yaml,
-        epochs=epochs,
-        batch=batch,
-        imgsz=imgsz,
-        lr0=lr0,
-        optimizer=optimizer,
-        device=device,
-        project=RUNS_DIR,
-        name=f"train_{run_id}",
-        exist_ok=True,
+    results_csv_path = os.path.join(RUNS_DIR, f"train_{run_id}", "results.csv")
+    update_run(
+        supabase,
+        run_id,
+        {
+            "results": {
+                "progress": {
+                    "epoch": 0,
+                    "total_epochs": epochs,
+                    "percent": 0.0,
+                    "eta_seconds": None,
+                    "eta": None,
+                }
+            }
+        },
     )
+
+    cancel_event = threading.Event()
+    cancel_stop, cancel_thread = start_cancel_poll_thread(supabase, run_id, cancel_event)
+    progress_stop, progress_thread = start_progress_thread(
+        supabase,
+        run_id,
+        epochs,
+        results_csv_path,
+        cancel_event,
+    )
+
+    model = YOLO(model_path)
+    callbacks = build_cancel_callbacks(model, cancel_event)
+    train_kwargs = {
+        "data": data_yaml,
+        "epochs": epochs,
+        "batch": batch,
+        "imgsz": imgsz,
+        "lr0": lr0,
+        "optimizer": optimizer,
+        "device": device,
+        "project": RUNS_DIR,
+        "name": f"train_{run_id}",
+        "exist_ok": True,
+    }
+    if callbacks:
+        train_kwargs["callbacks"] = callbacks
+    try:
+        results = model.train(**train_kwargs)
+    except TypeError as exc:
+        if "callbacks" in str(exc) and "callbacks" in train_kwargs:
+            train_kwargs.pop("callbacks", None)
+            results = model.train(**train_kwargs)
+        else:
+            raise
+
+    progress_stop.set()
+    progress_thread.join(timeout=2)
+    cancel_stop.set()
+    cancel_thread.join(timeout=2)
+
+    if cancel_event.is_set():
+        update_run(
+            supabase,
+            run_id,
+            {
+                "status": "canceled",
+                "canceled_at": utc_now(),
+                "completed_at": utc_now(),
+                "error_message": "Canceled by user.",
+            },
+        )
+        return
 
     save_dir = str(getattr(results, "save_dir", os.path.join(RUNS_DIR, f"train_{run_id}")))
     metrics = parse_results_csv(os.path.join(save_dir, "results.csv"))
@@ -300,12 +584,25 @@ def main():
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise SystemExit("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.")
 
-    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    storage_url = f"{SUPABASE_URL}storage/v1/"
+    os.environ.setdefault("SUPABASE_STORAGE_URL", storage_url)
+    if ClientOptions:
+        try:
+            supabase = create_client(
+                SUPABASE_URL,
+                SUPABASE_SERVICE_ROLE_KEY,
+                options=ClientOptions(storage_url=storage_url),
+            )
+        except Exception:
+            supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    else:
+        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     os.makedirs(RUNS_DIR, exist_ok=True)
     print(f"[{utc_now()}] Trainer service started (worker_id={WORKER_ID})")
     print(f"[{utc_now()}] Polling {RUNS_TABLE} every {POLL_INTERVAL}s")
 
     while True:
+        upsert_worker_heartbeat(supabase, status="online")
         run = get_next_run(supabase)
         if not run:
             print(f"[{utc_now()}] No queued runs. Sleeping {POLL_INTERVAL}s.")
@@ -323,6 +620,7 @@ def main():
             },
         )
 
+        stop_event, heartbeat_thread = start_heartbeat_thread(supabase, status="busy")
         try:
             print(f"[{utc_now()}] Starting run {run['id']}")
             run_training_job(supabase, run)
@@ -338,6 +636,10 @@ def main():
                     "error_message": str(exc),
                 },
             )
+        finally:
+            stop_event.set()
+            heartbeat_thread.join(timeout=2)
+            upsert_worker_heartbeat(supabase, status="online")
 
 
 if __name__ == "__main__":
