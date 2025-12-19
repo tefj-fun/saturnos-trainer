@@ -18,6 +18,7 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "sops")
+SUPABASE_DATASETS_BUCKET = os.getenv("SUPABASE_DATASETS_BUCKET", "datasets")
 
 DATASET_ROOT = os.getenv("DATASET_ROOT", "/mnt/d/datasets")
 RUNS_DIR = os.getenv("RUNS_DIR", "/mnt/d/datasets/runs")
@@ -37,22 +38,32 @@ def utc_now():
 
 def extract_storage_path(value):
     if not value:
-        return None
+        return None, None
     if value.startswith("storage:"):
-        return value.split("storage:", 1)[1].lstrip("/")
+        raw = value.split("storage:", 1)[1].lstrip("/")
+        if "/" in raw:
+            bucket, path = raw.split("/", 1)
+            return bucket, path
+        return SUPABASE_DATASETS_BUCKET, raw
     if value.startswith("http"):
         parsed = urlparse(value)
-        public_prefix = f"/storage/v1/object/public/{SUPABASE_STORAGE_BUCKET}/"
-        signed_prefix = f"/storage/v1/object/sign/{SUPABASE_STORAGE_BUCKET}/"
-        object_prefix = f"/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/"
-        for prefix in (public_prefix, signed_prefix, object_prefix):
+        prefixes = [
+            "/storage/v1/object/public/",
+            "/storage/v1/object/sign/",
+            "/storage/v1/object/",
+        ]
+        for prefix in prefixes:
             if prefix in parsed.path:
-                return unquote(parsed.path.split(prefix)[1])
-    return None
+                remainder = parsed.path.split(prefix, 1)[1]
+                parts = remainder.split("/", 1)
+                if len(parts) == 2:
+                    return parts[0], unquote(parts[1])
+        return None, None
+    return None, None
 
 
-def download_storage_file(supabase, remote_path, local_path):
-    result = supabase.storage.from_(SUPABASE_STORAGE_BUCKET).download(remote_path)
+def download_storage_file(supabase, bucket, remote_path, local_path):
+    result = supabase.storage.from_(bucket).download(remote_path)
     content = getattr(result, "data", result)
     if isinstance(content, dict) and "data" in content:
         content = content["data"]
@@ -64,17 +75,49 @@ def download_storage_file(supabase, remote_path, local_path):
     return local_path
 
 
+def download_dataset_prefix(supabase, bucket, storage_prefix, local_dir):
+    if not storage_prefix:
+        return
+    storage = supabase.storage.from_(bucket)
+    subdirs = [
+        "images/train",
+        "images/val",
+        "images/test",
+        "labels/train",
+        "labels/val",
+        "labels/test",
+    ]
+    for subdir in subdirs:
+        remote_dir = f"{storage_prefix}/{subdir}"
+        try:
+            items = storage.list(remote_dir) or []
+        except Exception:
+            items = []
+        for item in items:
+            name = item.get("name")
+            is_dir = item.get("metadata", {}).get("is_dir")
+            if not name or is_dir:
+                continue
+            remote_path = f"{remote_dir}/{name}"
+            local_path = os.path.join(local_dir, subdir, name)
+            download_storage_file(supabase, bucket, remote_path, local_path)
+
+
 def resolve_data_yaml(value, run_id, supabase):
     if not value:
         return None
     if os.path.isabs(value):
         return value
-    storage_path = extract_storage_path(value)
+    storage_bucket, storage_path = extract_storage_path(value)
     if storage_path:
+        bucket = storage_bucket or SUPABASE_DATASETS_BUCKET
         local_dir = os.path.join(DATASET_ROOT, "datasets", f"run_{run_id}")
         filename = os.path.basename(storage_path) or "data.yaml"
         local_path = os.path.join(local_dir, filename)
-        return download_storage_file(supabase, storage_path, local_path)
+        yaml_path = download_storage_file(supabase, bucket, storage_path, local_path)
+        storage_prefix = os.path.dirname(storage_path)
+        download_dataset_prefix(supabase, bucket, storage_prefix, local_dir)
+        return yaml_path
     if value.startswith("http"):
         local_dir = os.path.join(DATASET_ROOT, "datasets", f"run_{run_id}")
         os.makedirs(local_dir, exist_ok=True)
