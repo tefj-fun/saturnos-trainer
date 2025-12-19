@@ -121,7 +121,9 @@ def resolve_data_yaml(value, run_id, supabase):
     if not value:
         return None
     if os.path.isabs(value):
-        return value
+        yaml_path = value
+        local_dir = os.path.dirname(yaml_path)
+        return normalize_data_yaml(yaml_path, local_dir)
     storage_bucket, storage_path = extract_storage_path(value)
     if storage_path:
         bucket = storage_bucket or SUPABASE_DATASETS_BUCKET
@@ -131,14 +133,53 @@ def resolve_data_yaml(value, run_id, supabase):
         yaml_path = download_storage_file(supabase, bucket, storage_path, local_path)
         storage_prefix = os.path.dirname(storage_path)
         download_dataset_prefix(supabase, bucket, storage_prefix, local_dir)
-        return yaml_path
+        return normalize_data_yaml(yaml_path, local_dir)
     if value.startswith("http"):
         local_dir = os.path.join(DATASET_ROOT, "datasets", f"run_{run_id}")
         os.makedirs(local_dir, exist_ok=True)
         local_path = os.path.join(local_dir, "data.yaml")
         urllib.request.urlretrieve(value, local_path)
-        return local_path
+        return normalize_data_yaml(local_path, local_dir)
     return os.path.join(DATASET_ROOT, value)
+
+
+def normalize_data_yaml(yaml_path, local_dir):
+    if not yaml_path or not os.path.exists(yaml_path):
+        return yaml_path
+    try:
+        with open(yaml_path, "r", encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except Exception:
+        return yaml_path
+
+    updated = []
+    path_written = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("path:"):
+            updated.append(f"path: {local_dir}")
+            path_written = True
+            continue
+        if stripped.startswith("train:"):
+            updated.append("train: images/train")
+            continue
+        if stripped.startswith("val:"):
+            updated.append("val: images/val")
+            continue
+        if stripped.startswith("test:"):
+            updated.append("test: images/test")
+            continue
+        updated.append(line)
+
+    if not path_written:
+        updated.insert(0, f"path: {local_dir}")
+
+    try:
+        with open(yaml_path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(updated) + "\n")
+    except Exception:
+        return yaml_path
+    return yaml_path
 
 
 def map_base_model(value):
