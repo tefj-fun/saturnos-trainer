@@ -206,6 +206,8 @@ def normalize_task(raw_task):
 def infer_task_from_labels(dataset_root):
     if not dataset_root or not os.path.isdir(dataset_root):
         return "detect"
+    saw_segment = False
+    saw_bbox = False
     label_roots = [
         os.path.join(dataset_root, "labels", "train"),
         os.path.join(dataset_root, "labels", "val"),
@@ -225,13 +227,139 @@ def infer_task_from_labels(dataset_root):
                         if not line:
                             continue
                         parts = line.split()
-                        if len(parts) > 5:
-                            return "segment"
                         if len(parts) == 5:
+                            saw_bbox = True
+                            continue
+                        if len(parts) > 5:
+                            saw_segment = True
                             continue
             except Exception:
                 continue
+    if saw_segment and not saw_bbox:
+        return "segment"
     return "detect"
+
+
+def format_label_value(value):
+    formatted = f"{value:.6f}"
+    formatted = formatted.rstrip("0").rstrip(".")
+    return formatted if formatted else "0"
+
+
+def convert_bbox_to_polygon(parts):
+    if len(parts) != 5:
+        return None
+    try:
+        x_center, y_center, width, height = map(float, parts[1:5])
+    except ValueError:
+        return None
+    x1 = x_center - width / 2
+    y1 = y_center - height / 2
+    x2 = x_center + width / 2
+    y2 = y_center + height / 2
+    coords = [x1, y1, x2, y1, x2, y2, x1, y2]
+    return [parts[0]] + coords
+
+
+def convert_polygon_to_bbox(parts):
+    if len(parts) <= 5 or len(parts) % 2 != 1:
+        return None
+    try:
+        coords = [float(value) for value in parts[1:]]
+    except ValueError:
+        return None
+    if len(coords) < 6 or len(coords) % 2 != 0:
+        return None
+    xs = coords[0::2]
+    ys = coords[1::2]
+    x_min = min(xs)
+    x_max = max(xs)
+    y_min = min(ys)
+    y_max = max(ys)
+    x_center = (x_min + x_max) / 2
+    y_center = (y_min + y_max) / 2
+    width = x_max - x_min
+    height = y_max - y_min
+    return [parts[0], x_center, y_center, width, height]
+
+
+def normalize_labels_for_task(task, dataset_root):
+    if task not in ("detect", "segment"):
+        return {"converted": 0, "invalid": 0, "files": 0}
+    if not dataset_root or not os.path.isdir(dataset_root):
+        return {"converted": 0, "invalid": 0, "files": 0}
+
+    converted = 0
+    invalid = 0
+    updated_files = 0
+    label_roots = [
+        os.path.join(dataset_root, "labels", "train"),
+        os.path.join(dataset_root, "labels", "val"),
+        os.path.join(dataset_root, "labels", "test"),
+    ]
+    for label_root in label_roots:
+        if not os.path.isdir(label_root):
+            continue
+        for name in os.listdir(label_root):
+            if not name.endswith(".txt"):
+                continue
+            label_path = os.path.join(label_root, name)
+            try:
+                with open(label_path, "r", encoding="utf-8") as handle:
+                    lines = handle.read().splitlines()
+            except Exception:
+                continue
+            updated_lines = []
+            changed = False
+            for raw_line in lines:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) == 5:
+                    if task == "segment":
+                        converted_line = convert_bbox_to_polygon(parts)
+                        if converted_line:
+                            converted += 1
+                            changed = True
+                            formatted = [converted_line[0]] + [
+                                format_label_value(value) for value in converted_line[1:]
+                            ]
+                            updated_lines.append(" ".join(formatted))
+                        else:
+                            invalid += 1
+                            changed = True
+                    else:
+                        updated_lines.append(line)
+                    continue
+                if len(parts) > 5 and len(parts) % 2 == 1:
+                    if task == "detect":
+                        converted_line = convert_polygon_to_bbox(parts)
+                        if converted_line:
+                            converted += 1
+                            changed = True
+                            formatted = [converted_line[0]] + [
+                                format_label_value(value) for value in converted_line[1:]
+                            ]
+                            updated_lines.append(" ".join(formatted))
+                        else:
+                            invalid += 1
+                            changed = True
+                    else:
+                        updated_lines.append(line)
+                    continue
+                invalid += 1
+                changed = True
+            if changed:
+                try:
+                    with open(label_path, "w", encoding="utf-8") as handle:
+                        handle.write("\n".join(updated_lines))
+                        if updated_lines:
+                            handle.write("\n")
+                    updated_files += 1
+                except Exception:
+                    continue
+    return {"converted": converted, "invalid": invalid, "files": updated_files}
 
 
 def resolve_task(config, data_yaml):
@@ -581,6 +709,17 @@ def run_training_job(supabase, run):
         return
 
     task = resolve_task(config, data_yaml)
+    if task not in ("detect", "segment"):
+        task = "detect"
+    dataset_root = os.path.dirname(data_yaml) if data_yaml else None
+    normalization = normalize_labels_for_task(task, dataset_root)
+    if normalization["converted"] or normalization["invalid"]:
+        log(
+            "Normalized labels for task="
+            f"{task}: converted={normalization['converted']}, "
+            f"invalid={normalization['invalid']}, "
+            f"files={normalization['files']}"
+        )
     model_path = map_base_model(run.get("base_model"), task)
     epochs = int(config.get("epochs", 100))
     batch = int(config.get("batchSize", 16))
