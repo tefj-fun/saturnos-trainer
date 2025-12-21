@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import mimetypes
+import sys
 import threading
 import time
 import urllib.request
@@ -51,13 +52,88 @@ MODEL_MAP_SEGMENT = {
     "YOLOv8m": "yolov8m-seg.pt",
 }
 
+RAW_STDOUT = sys.stdout
+RAW_STDERR = sys.stderr
+
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
 def log(message):
-    print(f"[{utc_now()}] {message}", flush=True)
+    RAW_STDOUT.write(f"[{utc_now()}] {message}\n")
+    RAW_STDOUT.flush()
+
+
+class TimestampedStream:
+    def __init__(self, stream, timestamp_fn):
+        self._stream = stream
+        self._timestamp_fn = timestamp_fn
+        self._buffer = ""
+        self._lock = threading.Lock()
+
+    def _write_line(self, line):
+        if not line:
+            return
+        self._stream.write(f"[{self._timestamp_fn()}] {line}")
+
+    def write(self, data):
+        if not data:
+            return 0
+        with self._lock:
+            self._buffer += data
+            while True:
+                newline_index = self._buffer.find("\n")
+                carriage_index = self._buffer.find("\r")
+                if newline_index == -1 and carriage_index == -1:
+                    break
+                if newline_index == -1:
+                    split_index = carriage_index
+                elif carriage_index == -1:
+                    split_index = newline_index
+                else:
+                    split_index = min(newline_index, carriage_index)
+                line = self._buffer[:split_index]
+                separator = self._buffer[split_index]
+                self._buffer = self._buffer[split_index + 1 :]
+                self._write_line(line)
+                self._stream.write(separator)
+        return len(data)
+
+    def flush(self):
+        with self._lock:
+            if self._buffer:
+                self._write_line(self._buffer)
+                self._buffer = ""
+            self._stream.flush()
+
+    def isatty(self):
+        return self._stream.isatty()
+
+    def fileno(self):
+        return self._stream.fileno()
+
+    @property
+    def encoding(self):
+        return getattr(self._stream, "encoding", None)
+
+    @property
+    def errors(self):
+        return getattr(self._stream, "errors", None)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def install_timestamped_streams():
+    enabled = os.getenv("TIMESTAMP_STREAMS", "1").lower() not in ("0", "false", "no")
+    if not enabled:
+        return
+    sys.stdout = TimestampedStream(RAW_STDOUT, utc_now)
+    sys.stderr = TimestampedStream(RAW_STDERR, utc_now)
+
+
+install_timestamped_streams()
 
 
 def extract_storage_path(value):
