@@ -56,6 +56,10 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def log(message):
+    print(f"[{utc_now()}] {message}", flush=True)
+
+
 def extract_storage_path(value):
     if not value:
         return None, None
@@ -472,7 +476,7 @@ def upsert_worker_heartbeat(supabase, status="online"):
     try:
         supabase.table(WORKERS_TABLE).upsert(payload, on_conflict="worker_id").execute()
     except Exception as exc:
-        print(f"[{utc_now()}] Failed to update worker heartbeat: {exc}")
+        log(f"Failed to update worker heartbeat: {exc}")
 
 
 def start_heartbeat_thread(supabase, status):
@@ -703,14 +707,14 @@ def main():
     else:
         supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     os.makedirs(RUNS_DIR, exist_ok=True)
-    print(f"[{utc_now()}] Trainer service started (worker_id={WORKER_ID})")
-    print(f"[{utc_now()}] Polling {RUNS_TABLE} every {POLL_INTERVAL}s")
+    log(f"Trainer service started (worker_id={WORKER_ID})")
+    log(f"Polling {RUNS_TABLE} every {POLL_INTERVAL}s")
 
     while True:
         upsert_worker_heartbeat(supabase, status="online")
         run = get_next_run(supabase)
         if not run:
-            print(f"[{utc_now()}] No queued runs. Sleeping {POLL_INTERVAL}s.")
+            log(f"No queued runs. Sleeping {POLL_INTERVAL}s.")
             time.sleep(POLL_INTERVAL)
             continue
 
@@ -727,11 +731,11 @@ def main():
 
         stop_event, heartbeat_thread = start_heartbeat_thread(supabase, status="busy")
         try:
-            print(f"[{utc_now()}] Starting run {run['id']}")
+            log(f"Starting run {run['id']}")
             run_training_job(supabase, run)
-            print(f"[{utc_now()}] Completed run {run['id']}")
+            log(f"Completed run {run['id']}")
         except Exception as exc:
-            print(f"[{utc_now()}] Run {run['id']} failed: {exc}")
+            log(f"Run {run['id']} failed: {exc}")
             update_run(
                 supabase,
                 run["id"],
