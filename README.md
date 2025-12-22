@@ -2,7 +2,7 @@
 
 GitHub: https://github.com/tefj-fun/saturnos-trainer
 
-This service runs YOLOv8 segmentation training jobs on a Linux GPU server.
+This service runs YOLOv8 detection/segmentation training jobs on a Linux GPU server.
 It polls Supabase `training_runs` rows, launches training with Ultralytics
 YOLO, and uploads artifacts to Supabase Storage.
 
@@ -28,10 +28,16 @@ pip install -r requirements.txt
 export SUPABASE_URL="https://YOUR_PROJECT.supabase.co"
 export SUPABASE_SERVICE_ROLE_KEY="YOUR_SERVICE_ROLE_KEY"
 export SUPABASE_STORAGE_BUCKET="sops"
+export SUPABASE_DATASETS_BUCKET="datasets"
+export SUPABASE_ARTIFACTS_BUCKET="training-artifacts"
 export DATASET_ROOT="/mnt/d/datasets"
 export RUNS_DIR="/mnt/d/datasets/runs"
 export POLL_INTERVAL="10"
+export HEARTBEAT_INTERVAL="10"
+export PROGRESS_INTERVAL="10"
+export CANCEL_CHECK_INTERVAL="5"
 export WORKER_ID="trainer-1"
+export TIMESTAMP_STREAMS="1"
 ```
 
 3) Run the service:
@@ -45,14 +51,16 @@ python trainer_service.py
 The service reads `training_runs.configuration` (JSON) plus fields on the row.
 Supported keys and defaults:
 
-- `data_yaml` (or `dataYaml` in config): absolute path to the dataset YAML
+- `data_yaml` (or `dataYaml` in config): dataset YAML path or URL
 - `base_model`: `YOLOv8n`, `YOLOv8s`, `YOLOv8m`, or a `.pt` path (default `YOLOv8s`)
+- `task`/`modelTask`/`trainingTask`: `detect` or `segment` (auto-inferred if omitted)
 - `epochs` (default `100`)
 - `batchSize` (default `16`)
 - `imgSize` (default `640`)
 - `learningRate` (default `0.001`)
 - `optimizer` (default `Adam`)
 - `device` (default `0`)
+- `augmentation`: dict of YOLO augmentation values (e.g., `fliplr`, `mosaic`, `mixup`)
 
 If `data_yaml` is a relative path, it is resolved under `DATASET_ROOT`.
 
@@ -64,6 +72,19 @@ absolute path on the training server, for example:
 ```
 /mnt/d/datasets/my_project/data.yaml
 ```
+
+You can also point to:
+- `storage:` URIs (e.g., `storage:datasets/my_project/data.yaml`)
+- Supabase Storage URLs (public or signed)
+- Direct HTTP(S) URLs
+
+When using `storage:` or Supabase Storage URLs, the service downloads the YAML
+and dataset files under `images/` and `labels/` into `DATASET_ROOT/datasets/run_<id>`.
+
+## Logging
+
+The service logs timing checkpoints around dataset downloads, model loading, and
+training. Set `TIMESTAMP_STREAMS=0` to disable timestamped stdout/stderr.
 
 ## Outputs
 
