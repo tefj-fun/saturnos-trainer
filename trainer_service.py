@@ -438,6 +438,52 @@ def normalize_labels_for_task(task, dataset_root):
     return {"converted": converted, "invalid": invalid, "files": updated_files}
 
 
+def scan_label_stats(dataset_root):
+    stats = {
+        "total_labels": 0,
+        "label_files": 0,
+        "empty_files": 0,
+        "class_ids": set(),
+    }
+    if not dataset_root or not os.path.isdir(dataset_root):
+        return stats
+    label_roots = [
+        os.path.join(dataset_root, "labels", "train"),
+        os.path.join(dataset_root, "labels", "val"),
+        os.path.join(dataset_root, "labels", "test"),
+    ]
+    for label_root in label_roots:
+        if not os.path.isdir(label_root):
+            continue
+        for name in os.listdir(label_root):
+            if not name.endswith(".txt"):
+                continue
+            stats["label_files"] += 1
+            label_path = os.path.join(label_root, name)
+            try:
+                with open(label_path, "r", encoding="utf-8") as handle:
+                    saw_label = False
+                    for raw_line in handle:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        saw_label = True
+                        stats["total_labels"] += 1
+                        parts = line.split()
+                        if not parts:
+                            continue
+                        try:
+                            class_id = int(float(parts[0]))
+                        except ValueError:
+                            continue
+                        stats["class_ids"].add(class_id)
+                    if not saw_label:
+                        stats["empty_files"] += 1
+            except Exception:
+                continue
+    return stats
+
+
 def resolve_task(config, data_yaml):
     task = normalize_task(config.get("task"))
     if task:
@@ -470,6 +516,52 @@ def parse_config(raw_config):
         return json.loads(raw_config)
     except json.JSONDecodeError:
         return {}
+
+
+AUGMENTATION_KEYS = {
+    "hsv_h",
+    "hsv_s",
+    "hsv_v",
+    "degrees",
+    "translate",
+    "scale",
+    "shear",
+    "perspective",
+    "flipud",
+    "fliplr",
+    "mosaic",
+    "mixup",
+    "copy_paste",
+}
+
+
+def normalize_float(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_augmentation_kwargs(config):
+    if not isinstance(config, dict):
+        return {}
+    augmentation = config.get("augmentation") or {}
+    if isinstance(augmentation, str):
+        try:
+            augmentation = json.loads(augmentation)
+        except json.JSONDecodeError:
+            augmentation = {}
+    values = {}
+    for key in AUGMENTATION_KEYS:
+        raw = augmentation.get(key) if isinstance(augmentation, dict) else None
+        if raw is None and isinstance(config, dict):
+            raw = config.get(key)
+        value = normalize_float(raw)
+        if value is not None:
+            values[key] = value
+    return values
 
 
 def parse_results_csv(path):
@@ -796,6 +888,21 @@ def run_training_job(supabase, run):
             f"invalid={normalization['invalid']}, "
             f"files={normalization['files']}"
         )
+    label_stats = scan_label_stats(dataset_root)
+    if label_stats["total_labels"] == 0:
+        update_run(
+            supabase,
+            run_id,
+            {
+                "status": "failed",
+                "completed_at": utc_now(),
+                "error_message": (
+                    "No labeled annotations found in the dataset. "
+                    "Add labels (and ensure class names are assigned) then retry."
+                ),
+            },
+        )
+        return
     model_path = map_base_model(run.get("base_model"), task)
     epochs = int(config.get("epochs", 100))
     batch = int(config.get("batchSize", 16))
@@ -845,6 +952,9 @@ def run_training_job(supabase, run):
         "name": f"train_{run_id}",
         "exist_ok": True,
     }
+    augmentation_kwargs = extract_augmentation_kwargs(config)
+    if augmentation_kwargs:
+        train_kwargs.update(augmentation_kwargs)
     if callbacks:
         train_kwargs["callbacks"] = callbacks
     try:
