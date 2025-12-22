@@ -64,6 +64,10 @@ def log(message):
     RAW_STDOUT.write(f"[{utc_now()}] {message}\n")
     RAW_STDOUT.flush()
 
+def log_duration(message, start_time):
+    elapsed = time.time() - start_time
+    log(f"{message} ({elapsed:.1f}s)")
+
 
 class TimestampedStream:
     def __init__(self, stream, timestamp_fn):
@@ -177,7 +181,7 @@ def download_storage_file(supabase, bucket, remote_path, local_path):
 
 def download_dataset_prefix(supabase, bucket, storage_prefix, local_dir):
     if not storage_prefix:
-        return
+        return 0
     storage = supabase.storage.from_(bucket)
     subdirs = [
         "images/train",
@@ -187,26 +191,43 @@ def download_dataset_prefix(supabase, bucket, storage_prefix, local_dir):
         "labels/val",
         "labels/test",
     ]
+    total_downloaded = 0
     for subdir in subdirs:
         remote_dir = f"{storage_prefix}/{subdir}"
+        log(f"Listing storage files: {bucket}/{remote_dir}")
         try:
             items = storage.list(remote_dir) or []
-        except Exception:
+        except Exception as exc:
+            log(f"Failed to list {bucket}/{remote_dir}: {exc}")
             items = []
+        files = []
         for item in items:
-            name = item.get("name")
-            is_dir = item.get("metadata", {}).get("is_dir")
+            name = item.get("name") if isinstance(item, dict) else None
+            metadata = item.get("metadata") if isinstance(item, dict) else None
+            is_dir = (metadata or {}).get("is_dir")
             if not name or is_dir:
                 continue
+            files.append(name)
+        if not files:
+            continue
+        log(f"Downloading {len(files)} files from {bucket}/{remote_dir}")
+        for index, name in enumerate(files, start=1):
             remote_path = f"{remote_dir}/{name}"
             local_path = os.path.join(local_dir, subdir, name)
             download_storage_file(supabase, bucket, remote_path, local_path)
+            if index % 100 == 0 or index == len(files):
+                log(f"Downloaded {index}/{len(files)} from {bucket}/{remote_dir}")
+        total_downloaded += len(files)
+    if total_downloaded:
+        log(f"Downloaded {total_downloaded} files from storage prefix {bucket}/{storage_prefix}")
+    return total_downloaded
 
 
 def resolve_data_yaml(value, run_id, supabase):
     if not value:
         return None
     if os.path.isabs(value):
+        log(f"Using local dataset YAML: {value}")
         yaml_path = value
         local_dir = os.path.dirname(yaml_path)
         return normalize_data_yaml(yaml_path, local_dir)
@@ -216,17 +237,30 @@ def resolve_data_yaml(value, run_id, supabase):
         local_dir = os.path.join(DATASET_ROOT, "datasets", f"run_{run_id}")
         filename = os.path.basename(storage_path) or "data.yaml"
         local_path = os.path.join(local_dir, filename)
+        log(f"Downloading dataset YAML from storage: {bucket}/{storage_path}")
+        start_time = time.time()
         yaml_path = download_storage_file(supabase, bucket, storage_path, local_path)
+        log_duration(f"Downloaded dataset YAML to {yaml_path}", start_time)
         storage_prefix = os.path.dirname(storage_path)
-        download_dataset_prefix(supabase, bucket, storage_prefix, local_dir)
+        if storage_prefix:
+            log(f"Downloading dataset files from storage prefix: {bucket}/{storage_prefix}")
+        start_time = time.time()
+        downloaded = download_dataset_prefix(supabase, bucket, storage_prefix, local_dir)
+        if downloaded:
+            log_duration(f"Downloaded dataset files ({downloaded})", start_time)
         return normalize_data_yaml(yaml_path, local_dir)
     if value.startswith("http"):
         local_dir = os.path.join(DATASET_ROOT, "datasets", f"run_{run_id}")
         os.makedirs(local_dir, exist_ok=True)
         local_path = os.path.join(local_dir, "data.yaml")
+        log(f"Downloading dataset YAML from URL: {value}")
+        start_time = time.time()
         urllib.request.urlretrieve(value, local_path)
+        log_duration(f"Downloaded dataset YAML to {local_path}", start_time)
         return normalize_data_yaml(local_path, local_dir)
-    return os.path.join(DATASET_ROOT, value)
+    resolved_path = os.path.join(DATASET_ROOT, value)
+    log(f"Resolved dataset YAML path: {resolved_path}")
+    return resolved_path
 
 
 def normalize_data_yaml(yaml_path, local_dir):
@@ -851,7 +885,10 @@ def build_cancel_callbacks(model, cancel_event):
 def run_training_job(supabase, run):
     run_id = run["id"]
     config = parse_config(run.get("configuration"))
+    log(f"Run {run_id}: resolving dataset YAML")
+    step_start = time.time()
     data_yaml = resolve_data_yaml(run.get("data_yaml") or config.get("dataYaml"), run_id, supabase)
+    log_duration(f"Run {run_id}: resolved dataset YAML to {data_yaml}", step_start)
     if not data_yaml or not os.path.exists(data_yaml):
         update_run(
             supabase,
@@ -880,7 +917,17 @@ def run_training_job(supabase, run):
     if task not in ("detect", "segment"):
         task = "detect"
     dataset_root = os.path.dirname(data_yaml) if data_yaml else None
+    log(f"Run {run_id}: normalizing labels for task={task}")
+    step_start = time.time()
     normalization = normalize_labels_for_task(task, dataset_root)
+    log_duration(
+        (
+            f"Run {run_id}: label normalization done "
+            f"(converted={normalization['converted']}, "
+            f"invalid={normalization['invalid']}, files={normalization['files']})"
+        ),
+        step_start,
+    )
     if normalization["converted"] or normalization["invalid"]:
         log(
             "Normalized labels for task="
@@ -888,7 +935,16 @@ def run_training_job(supabase, run):
             f"invalid={normalization['invalid']}, "
             f"files={normalization['files']}"
         )
+    log(f"Run {run_id}: scanning label stats in {dataset_root}")
+    step_start = time.time()
     label_stats = scan_label_stats(dataset_root)
+    log_duration(
+        (
+            f"Run {run_id}: label scan found {label_stats['total_labels']} labels "
+            f"in {label_stats['label_files']} files ({label_stats['empty_files']} empty)"
+        ),
+        step_start,
+    )
     if label_stats["total_labels"] == 0:
         update_run(
             supabase,
@@ -910,6 +966,11 @@ def run_training_job(supabase, run):
     lr0 = float(config.get("learningRate", 0.001))
     optimizer = config.get("optimizer", "Adam")
     device = config.get("device", 0)
+    log(
+        "Run "
+        f"{run_id}: task={task}, model={model_path}, epochs={epochs}, "
+        f"batch={batch}, imgsz={imgsz}, lr0={lr0}, optimizer={optimizer}, device={device}"
+    )
 
     results_csv_path = os.path.join(RUNS_DIR, f"train_{run_id}", "results.csv")
     update_run(
@@ -938,7 +999,11 @@ def run_training_job(supabase, run):
         cancel_event,
     )
 
+    model_exists = os.path.exists(model_path)
+    log(f"Run {run_id}: loading model {model_path} (local={model_exists})")
+    step_start = time.time()
     model = YOLO(model_path)
+    log_duration(f"Run {run_id}: model loaded", step_start)
     callbacks = build_cancel_callbacks(model, cancel_event)
     train_kwargs = {
         "data": data_yaml,
@@ -957,6 +1022,7 @@ def run_training_job(supabase, run):
         train_kwargs.update(augmentation_kwargs)
     if callbacks:
         train_kwargs["callbacks"] = callbacks
+    log(f"Run {run_id}: starting training")
     try:
         results = model.train(**train_kwargs)
     except TypeError as exc:
@@ -966,6 +1032,7 @@ def run_training_job(supabase, run):
         else:
             raise
 
+    log(f"Run {run_id}: training finished, collecting artifacts")
     progress_stop.set()
     progress_thread.join(timeout=2)
     cancel_stop.set()
@@ -986,7 +1053,9 @@ def run_training_job(supabase, run):
 
     save_dir = str(getattr(results, "save_dir", os.path.join(RUNS_DIR, f"train_{run_id}")))
     metrics = parse_results_csv(os.path.join(save_dir, "results.csv"))
+    step_start = time.time()
     artifacts = upload_artifacts(supabase, run_id, save_dir)
+    log_duration(f"Run {run_id}: uploaded {len(artifacts)} artifacts", step_start)
 
     trained_model_url = None
     for artifact in artifacts:
